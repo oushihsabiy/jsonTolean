@@ -150,15 +150,19 @@ def run_concise_to_lean(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="jsonTolean pipeline — preprocess → concise_to_lean → Lean 4 files.",
+        description=(
+            "jsonTolean pipeline — preprocess → concise_to_lean → Lean 4 files.\n"
+            "With no arguments, processes all JSON files in RAWJSON_SRC_DIR (default: input_json/)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--mode", required=True, choices=["book"],
-        help="Pipeline mode (currently only 'book').",
+        "--mode", default="book", choices=["book"],
+        help="Pipeline mode (default: book).",
     )
     parser.add_argument(
-        "--input", required=True, dest="input_json",
-        help="Path to the input JSON file.",
+        "--input", default=None, dest="input_json",
+        help="Path to a single input JSON file. Omit to process all files in RAWJSON_SRC_DIR.",
     )
     parser.add_argument(
         "--output-dir", default=None, dest="output_dir",
@@ -179,52 +183,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    settings_path = Path(args.settings).resolve() if args.settings else None
-    settings = load_settings(settings_path)
-    config = load_config()
-
-    input_path = Path(args.input_json).expanduser().resolve()
-    if not input_path.exists():
-        print(f"[error] input file not found: {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # Determine output directories
-    work_dir = _ROOT / settings.get("WORK_DIR", "work")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.output_dir:
-        lean_out_dir = Path(args.output_dir).expanduser().resolve()
-    else:
-        lean_out_dir = _ROOT / "output_lean" / input_path.stem
-
-    think_workers = max(1, int(settings.get("THINK_WORKERS", 4)))
-    max_tokens = int(settings.get("OCR_MAX_TOKENS") or DEFAULT_MAX_TOKENS)
-    overwrite = args.overwrite or bool(settings.get("OVERWRITE_JSON", False))
-
-    # Build OpenAI client
-    api_key = require_str(config, "api_key")
-    base_url = require_str(config, "base_url")
-    model = require_str(config, "model")
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=DEFAULT_TIMEOUT_SECONDS)
+def process_file(
+    input_path: Path,
+    *,
+    work_dir: Path,
+    lean_out_dir: Optional[Path],
+    client: OpenAI,
+    model: str,
+    think_workers: int,
+    max_tokens: int,
+    overwrite: bool,
+    skip_concise: bool,
+    concise_prompt: str,
+    lean_prompt: str,
+) -> int:
+    """Run the full 3-step pipeline for a single JSON file.
+    Returns the number of Lean files written."""
+    out_dir = lean_out_dir if lean_out_dir else _ROOT / "output_lean" / input_path.stem
 
     # ── Step 0: Load & preprocess ──────────────────────────────────────────
     print(f"[step 0] loading & preprocessing {input_path.name}", file=sys.stderr)
     data = read_json(input_path)
     data = preprocess(data)
 
-    # Save preprocessed JSON for traceability
     preprocessed_path = work_dir / f"{input_path.stem}_preprocessed.json"
     write_json(preprocessed_path, data)
     print(f"  → preprocessed JSON saved to {preprocessed_path}", file=sys.stderr)
 
     # ── Step 1: concise_to_lean ────────────────────────────────────────────
-    if args.skip_concise:
+    if skip_concise:
         print("[step 1] skipped (--skip-concise).", file=sys.stderr)
     else:
-        print(f"[step 1] concise_to_lean: rewriting problem fields", file=sys.stderr)
-        concise_prompt = load_prompt(None)
+        print("[step 1] concise_to_lean: rewriting problem fields", file=sys.stderr)
         data = run_concise_to_lean(
             data,
             client=client,
@@ -235,17 +225,15 @@ def main() -> None:
             think_workers=think_workers,
         )
 
-    # Save post-concise JSON
     concise_path = work_dir / f"{input_path.stem}_concise.json"
     write_json(concise_path, data)
     print(f"  → concise JSON saved to {concise_path}", file=sys.stderr)
 
     # ── Step 2: jsonTolean ─────────────────────────────────────────────────
-    print(f"[step 2] jsonTolean: generating Lean 4 files → {lean_out_dir}", file=sys.stderr)
-    lean_prompt = load_lean_prompt()
+    print(f"[step 2] jsonTolean: generating Lean 4 files → {out_dir}", file=sys.stderr)
     written = convert_json_to_lean(
         concise_path,
-        lean_out_dir,
+        out_dir,
         client=client,
         model=model,
         base_prompt=lean_prompt,
@@ -254,8 +242,79 @@ def main() -> None:
         overwrite=overwrite,
     )
 
+    print(f"{'='*60}", file=sys.stderr)
+    print(f"DONE [{input_path.name}] — {len(written)} Lean file(s) in {out_dir}", file=sys.stderr)
+    return len(written)
+
+
+def main() -> None:
+    args = parse_args()
+    settings_path = Path(args.settings).resolve() if args.settings else None
+    settings = load_settings(settings_path)
+    config = load_config()
+
+    work_dir = _ROOT / settings.get("WORK_DIR", "work")
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    think_workers = max(1, int(settings.get("THINK_WORKERS", 4)))
+    max_tokens = int(settings.get("OCR_MAX_TOKENS") or DEFAULT_MAX_TOKENS)
+    overwrite = args.overwrite or bool(settings.get("OVERWRITE_JSON", False))
+
+    # Build OpenAI client (once, shared across all files)
+    api_key = require_str(config, "api_key")
+    base_url = require_str(config, "base_url")
+    model = require_str(config, "model")
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=DEFAULT_TIMEOUT_SECONDS)
+    concise_prompt = load_prompt(None)
+    lean_prompt = load_lean_prompt()
+
+    # Resolve input file list
+    if args.input_json:
+        # Single file specified explicitly
+        input_files = [Path(args.input_json).expanduser().resolve()]
+        missing = [f for f in input_files if not f.exists()]
+        if missing:
+            print(f"[error] input file not found: {missing[0]}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Batch mode: scan RAWJSON_SRC_DIR for all *.json files
+        raw_src = _ROOT / settings.get("RAWJSON_SRC_DIR", "input_json")
+        if not raw_src.exists():
+            print(f"[error] RAWJSON_SRC_DIR not found: {raw_src}", file=sys.stderr)
+            print("  Place JSON files there or use --input <file>.", file=sys.stderr)
+            sys.exit(1)
+        input_files = sorted(raw_src.glob("*.json"))
+        if not input_files:
+            print(f"[error] no JSON files found in {raw_src}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[batch] found {len(input_files)} JSON file(s) in {raw_src}", file=sys.stderr)
+
+    # Determine lean output dir (only relevant when processing a single file with --output-dir)
+    lean_out_dir: Optional[Path] = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+
+    total_written = 0
+    for i, input_path in enumerate(input_files, start=1):
+        if len(input_files) > 1:
+            print(f"\n{'#'*60}", file=sys.stderr)
+            print(f"# File {i}/{len(input_files)}: {input_path.name}", file=sys.stderr)
+            print(f"{'#'*60}", file=sys.stderr)
+        n = process_file(
+            input_path,
+            work_dir=work_dir,
+            lean_out_dir=lean_out_dir,
+            client=client,
+            model=model,
+            think_workers=think_workers,
+            max_tokens=max_tokens,
+            overwrite=overwrite,
+            skip_concise=args.skip_concise,
+            concise_prompt=concise_prompt,
+            lean_prompt=lean_prompt,
+        )
+        total_written += n
+
     print(f"\n{'='*60}", file=sys.stderr)
-    print(f"ALL DONE — {len(written)} Lean file(s) in {lean_out_dir}", file=sys.stderr)
+    print(f"ALL DONE — {total_written} Lean file(s) total from {len(input_files)} file(s).", file=sys.stderr)
 
 
 if __name__ == "__main__":
