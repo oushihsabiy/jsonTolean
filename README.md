@@ -60,6 +60,11 @@ Outputs are written to:
 - `work/...` for intermediate Markdown and LaTeX files
 - `output_json/...` for final JSON files
 
+JSON input for conversion
+
+- Place lean-friendly JSON files (for `jsonTolean.py`) in the project root `input_json/` directory.
+	These files will be consumed by `main.py --mode book` when `RAWJSON_SRC_DIR` is set to `input_json` in `settings.json`.
+
 The directory structure under `work/` and `output_json/` mirrors the relative path under `input_pdfs/`.
 
 ## Notes

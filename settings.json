@@ -2,6 +2,7 @@
   "INPUT_PDF_DIR": "input_pdfs",
   "OUTPUT_JSON_DIR": "output_json",
   "WORK_DIR": "work",
+  "RAWJSON_SRC_DIR": "input_json",
   "PIPELINE_MODE": "book",
   "OCR_MAX_TOKENS": null,
   "ONLY_THESE_STEMS": [],
