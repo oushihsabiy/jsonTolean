@@ -98,7 +98,6 @@ def chat_completion_lean(
 ) -> str:
     """Call the chat API expecting plain-text (Lean code) output."""
     global CHAT_FORCE_STREAM
-
     kwargs = dict(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -107,18 +106,38 @@ def chat_completion_lean(
         max_tokens=max_tokens,
     )
 
+    # If streaming is forced we cannot reliably obtain usage metadata,
+    # so return text and None for usage.
     if CHAT_FORCE_STREAM is True:
         stream_obj = client.chat.completions.create(stream=True, **kwargs)
-        return _collect_stream_text(stream_obj).strip()
+        return _collect_stream_text(stream_obj).strip(), None
 
     try:
         response = client.chat.completions.create(**kwargs)
-        return (response.choices[0].message.content or "").strip()
+        text = (response.choices[0].message.content or "").strip()
+
+        usage = None
+        try:
+            usage_obj = getattr(response, "usage", None)
+            if usage_obj is None and isinstance(response, dict):
+                usage_obj = response.get("usage")
+            if usage_obj:
+                try:
+                    usage = {k: getattr(usage_obj, k) for k in ("prompt_tokens", "completion_tokens", "total_tokens") if getattr(usage_obj, k, None) is not None}
+                except Exception:
+                    try:
+                        usage = dict(usage_obj)
+                    except Exception:
+                        usage = None
+        except Exception:
+            usage = None
+
+        return text, usage
     except Exception as err:
         if _is_stream_required_error(err):
             CHAT_FORCE_STREAM = True
             stream_obj = client.chat.completions.create(stream=True, **kwargs)
-            return _collect_stream_text(stream_obj).strip()
+            return _collect_stream_text(stream_obj).strip(), None
         raise
 
 
@@ -209,9 +228,17 @@ def convert_one_exercise(
     exercise: Dict[str, Any],
     max_tokens: int,
     max_attempts: int,
+    fallback_index: int,
+    log_path: Optional[Path] = None,
 ) -> str:
-    """Send one exercise to the LLM and return Lean code string."""
+    """Send one exercise to the LLM and return Lean code string.
+
+    Records usage for every API call to `log_path` if provided. The log is a
+    JSON-lines file with one object per call containing `label`, `attempt`, and
+    the `usage` dict when available, plus any validation errors.
+    """
     last_error = ""
+    label = exercise.get("source_idx") or exercise.get("index") or str(fallback_index)
 
     for attempt in range(1, max_attempts + 1):
         prompt = build_prompt(base_prompt, exercise)
@@ -221,21 +248,40 @@ def convert_one_exercise(
                 "Please output ONLY valid Lean 4 code. No JSON, no explanations."
             )
 
-        response_text = chat_completion_lean(
+        response_text, usage = chat_completion_lean(
             client, model=model, prompt=prompt, max_tokens=max_tokens,
         )
+
+        # Try to extract Lean code and validate; capture validation errors.
+        validation_error = ""
+        lean_code: Optional[str] = None
         try:
             lean_code = extract_lean_code(response_text)
+            validation_error = validate_lean_output(lean_code)
         except Exception as err:
-            last_error = str(err)
-            continue
+            validation_error = str(err)
 
-        validation_error = validate_lean_output(lean_code)
+        # Log this API call (usage may be None for streaming responses)
+        if log_path:
+            entry = {
+                "label": label,
+                "attempt": attempt,
+                "usage": usage,
+                "validation_error": validation_error or None,
+            }
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                # Logging must not stop the conversion process.
+                pass
+
         if validation_error:
             last_error = validation_error
             continue
 
-        return lean_code
+        return lean_code or ""
 
     raise RuntimeError(
         f"Failed to obtain valid Lean code after {max_attempts} attempts: {last_error}"
@@ -285,6 +331,7 @@ def convert_json_to_lean(
 
         print(f"  [{idx}/{total}] converting '{label}' → {filename}", file=sys.stderr)
         try:
+            log_path = output_dir / "api_usage.jsonl"
             lean_code = convert_one_exercise(
                 client,
                 model=model,
@@ -292,6 +339,8 @@ def convert_json_to_lean(
                 exercise=exercise,
                 max_tokens=max_tokens,
                 max_attempts=max_attempts,
+                fallback_index=idx,
+                log_path=log_path,
             )
             out_path.write_text(lean_code + "\n", encoding="utf-8")
             written.append(out_path)
